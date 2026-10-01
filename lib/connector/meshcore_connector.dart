@@ -2783,6 +2783,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _repeaterBatterySnapshots.clear();
     _batteryRequested = false;
     _awaitingSelfInfo = false;
+    _initialSyncComplete = false;
     _hasReceivedDeviceInfo = false;
     _pendingInitialChannelSync = false;
     _pendingInitialContactsSync = false;
@@ -4151,6 +4152,9 @@ class MeshCoreConnector extends ChangeNotifier {
       debugPrint('[QueueSync] Max retries reached, stopping sync');
       _queuedMessageSyncInFlight = false;
       _isSyncingQueuedMessages = false;
+      // A radio that never answers the first drain must not leave the sync
+      // banner armed for the whole session.
+      _completedFirstQueueDrain = true;
       notifyListeners();
       _queueSyncRetries = 0;
     }
@@ -5028,9 +5032,10 @@ final frame = buildRepeaterDiscoveryFrame(tag);
 
   void _handleDeviceInfo(Uint8List frame) {
     if (frame.length < 4) return;
-    if (_shouldGateInitialChannelSync) {
-      _hasReceivedDeviceInfo = true;
-    }
+    // Every transport sends DEVICE_QUERY. Setting this only under the
+    // channel-sync gate left native BLE with _initialSyncComplete never
+    // true, so every later queue drain and refetch painted a sync banner.
+    _hasReceivedDeviceInfo = true;
     _firmwareVerCode = frame[1];
 
     if (frame.length >= 80) {
@@ -8011,6 +8016,13 @@ final frame = buildRepeaterDiscoveryFrame(tag);
     // Preserve deviceId and displayName for UI display during reconnection
     // They're only cleared on manual disconnect via disconnect() method
     _hasReceivedDeviceInfo = false;
+    // The reconnect resyncs from scratch, so it shows the sync banner again.
+    // A drop mid-handshake must also clear the device-info wait, or the
+    // banner sticks on "Reading device info" until the next attempt.
+    _initialSyncComplete = false;
+    _awaitingSelfInfo = false;
+    _selfInfoRetryTimer?.cancel();
+    _selfInfoRetryTimer = null;
     _pendingInitialChannelSync = false;
     _pendingInitialContactsSync = false;
     _maxContacts = _defaultMaxContacts;
@@ -8154,9 +8166,14 @@ final frame = buildRepeaterDiscoveryFrame(tag);
 
   @override
   void notifyListeners() {
+    // "Nothing in flight" is also true in the gaps between steps (SELF_INFO
+    // handled but getContacts not yet called), which on BLE declared the
+    // sync complete before the contact download even started. The first
+    // queue drain is the last step on every transport, so gate on it.
     if (isConnected &&
         !_initialSyncComplete &&
         _hasReceivedDeviceInfo &&
+        _completedFirstQueueDrain &&
         !_awaitingSelfInfo &&
         !_isLoadingContacts &&
         !_isLoadingChannels &&
