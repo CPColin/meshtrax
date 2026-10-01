@@ -1580,10 +1580,25 @@ class MeshCoreConnector extends ChangeNotifier {
             state == MeshCoreConnectionState.disconnecting);
   }
 
+  /// [autoRetry] marks an attempt made by the reconnect timer rather than the
+  /// user: it keeps the backoff counter and survives a silent handshake.
+  /// A link that opened but stayed silent is, on a retry to a radio we were
+  /// already talking to, the radio at the edge of range rather than a pairing
+  /// problem: the loop keeps going. Every other failure still stops it, and a
+  /// user-initiated attempt always stops so the scanner can show the error.
+  @visibleForTesting
+  static bool shouldKeepAutoReconnect({
+    required bool autoRetry,
+    required MeshCoreBleFailure kind,
+  }) {
+    return autoRetry && kind == MeshCoreBleFailure.handshakeTimeout;
+  }
+
   Future<void> connect(
     BluetoothDevice device, {
     String? displayName,
     Future<String?> Function()? linuxPairingPinProvider,
+    bool autoRetry = false,
   }) async {
     final requestedDeviceId = device.remoteId.toString();
     if (_state == MeshCoreConnectionState.connecting ||
@@ -1626,7 +1641,12 @@ class MeshCoreConnector extends ChangeNotifier {
     _lastDeviceId = _deviceId;
     _lastDeviceDisplayName = _deviceDisplayName;
     _manualDisconnect = false;
-    _cancelReconnectTimer();
+    // An automatic retry keeps the backoff counter. Zeroing it here made the
+    // disconnect(manual: false) inside the catch below reschedule at the 1s
+    // floor on every failure, so the loop never backed off.
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    if (!autoRetry) _reconnectAttempts = 0;
     _bleInitialSyncStarted = false;
     if (PlatformInfo.isWeb) {
       _resetConnectionHandshakeState();
@@ -2001,6 +2021,7 @@ class MeshCoreConnector extends ChangeNotifier {
         _pendingInitialChannelSync = true;
       }
       await _startBleInitialSync();
+      _reconnectAttempts = 0;
     } catch (e) {
       _appDebugLogService?.error('Connection error: $e', tag: 'BLE Connect');
       if (shouldIgnoreLateBleConnectError(
@@ -2017,6 +2038,14 @@ class MeshCoreConnector extends ChangeNotifier {
         return;
       }
       if (e is MeshCoreBleFailureException) {
+        if (shouldKeepAutoReconnect(autoRetry: autoRetry, kind: e.kind)) {
+          _appDebugLogService?.warn(
+            'BLE ${e.kind.name} during auto-reconnect: retrying',
+            tag: 'BLE Connect',
+          );
+          await disconnect(manual: false);
+          rethrow;
+        }
         _appDebugLogService?.warn(
           'BLE ${e.kind.name}: stopping reconnect until user retries manually',
           tag: 'BLE Connect',
@@ -2601,14 +2630,15 @@ class MeshCoreConnector extends ChangeNotifier {
               : BluetoothDevice.fromId(_lastDeviceId!));
       if (device == null) return;
 
-      // connect() zeroes the backoff counter (it treats itself as a fresh
-      // user attempt) — remember it so failed retries keep backing off
-      // toward the 30s cap instead of hammering at the floor delay.
-      final priorAttempts = _reconnectAttempts;
       try {
-        await connect(device, displayName: _lastDeviceDisplayName);
+        await connect(
+          device,
+          displayName: _lastDeviceDisplayName,
+          autoRetry: true,
+        );
       } catch (_) {
-        _reconnectAttempts = priorAttempts;
+        // A failed attempt normally reschedules itself through
+        // disconnect(manual: false); this covers one that never got there.
         _scheduleReconnect();
       }
     });
@@ -2753,6 +2783,7 @@ class MeshCoreConnector extends ChangeNotifier {
     _repeaterBatterySnapshots.clear();
     _batteryRequested = false;
     _awaitingSelfInfo = false;
+    _initialSyncComplete = false;
     _hasReceivedDeviceInfo = false;
     _pendingInitialChannelSync = false;
     _pendingInitialContactsSync = false;
@@ -4121,6 +4152,9 @@ class MeshCoreConnector extends ChangeNotifier {
       debugPrint('[QueueSync] Max retries reached, stopping sync');
       _queuedMessageSyncInFlight = false;
       _isSyncingQueuedMessages = false;
+      // A radio that never answers the first drain must not leave the sync
+      // banner armed for the whole session.
+      _completedFirstQueueDrain = true;
       notifyListeners();
       _queueSyncRetries = 0;
     }
@@ -4998,9 +5032,10 @@ final frame = buildRepeaterDiscoveryFrame(tag);
 
   void _handleDeviceInfo(Uint8List frame) {
     if (frame.length < 4) return;
-    if (_shouldGateInitialChannelSync) {
-      _hasReceivedDeviceInfo = true;
-    }
+    // Every transport sends DEVICE_QUERY. Setting this only under the
+    // channel-sync gate left native BLE with _initialSyncComplete never
+    // true, so every later queue drain and refetch painted a sync banner.
+    _hasReceivedDeviceInfo = true;
     _firmwareVerCode = frame[1];
 
     if (frame.length >= 80) {
@@ -7950,6 +7985,11 @@ final frame = buildRepeaterDiscoveryFrame(tag);
   }
 
   void _handleDisconnection() {
+    _appDebugLogService?.warn(
+      'BLE link to ${_deviceDisplayName ?? _deviceId} dropped; '
+      'scheduling reconnect',
+      tag: 'Connection',
+    );
     _stopBatteryPolling();
     _gpsPollTimer?.cancel();
     _gpsPollTimer = null;
@@ -7976,6 +8016,13 @@ final frame = buildRepeaterDiscoveryFrame(tag);
     // Preserve deviceId and displayName for UI display during reconnection
     // They're only cleared on manual disconnect via disconnect() method
     _hasReceivedDeviceInfo = false;
+    // The reconnect resyncs from scratch, so it shows the sync banner again.
+    // A drop mid-handshake must also clear the device-info wait, or the
+    // banner sticks on "Reading device info" until the next attempt.
+    _initialSyncComplete = false;
+    _awaitingSelfInfo = false;
+    _selfInfoRetryTimer?.cancel();
+    _selfInfoRetryTimer = null;
     _pendingInitialChannelSync = false;
     _pendingInitialContactsSync = false;
     _maxContacts = _defaultMaxContacts;
@@ -8119,9 +8166,14 @@ final frame = buildRepeaterDiscoveryFrame(tag);
 
   @override
   void notifyListeners() {
+    // "Nothing in flight" is also true in the gaps between steps (SELF_INFO
+    // handled but getContacts not yet called), which on BLE declared the
+    // sync complete before the contact download even started. The first
+    // queue drain is the last step on every transport, so gate on it.
     if (isConnected &&
         !_initialSyncComplete &&
         _hasReceivedDeviceInfo &&
+        _completedFirstQueueDrain &&
         !_awaitingSelfInfo &&
         !_isLoadingContacts &&
         !_isLoadingChannels &&
