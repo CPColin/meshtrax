@@ -1,4 +1,3 @@
-import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -13,15 +12,15 @@ Uint8List key(List<int> prefix, int fill) {
   return bytes;
 }
 
-Contact repeater(
-  int prefix,
+Contact node(
+  List<int> prefix,
   int fill,
   String name,
   double? latitude,
   double? longitude,
 ) {
   return Contact(
-    publicKey: key([prefix], fill),
+    publicKey: key(prefix, fill),
     name: name,
     type: advTypeRepeater,
     pathLength: 0,
@@ -32,8 +31,16 @@ Contact repeater(
   );
 }
 
+Contact repeater(
+  int prefix,
+  int fill,
+  String name,
+  double? latitude,
+  double? longitude,
+) => node([prefix], fill, name, latitude, longitude);
+
 void main() {
-  group('buildPathHops, ()', () {
+  group('buildPathHops', () {
     final repeatersBoth = [
       repeater(0xc5, 0x00, "Solar Heltec v4 Test", null, null),
       repeater(0xbe, 0x00, "Pythia", 37.77276, -122.44410),
@@ -109,21 +116,32 @@ void main() {
       );
     });
 
+    test('hop indices start at 1', () {
+      expect(
+        PathResolver.buildPathHops(
+          Uint8List.fromList(pathBytes),
+          repeatersBoth + repeatersNorth + repeatersSouth,
+        ).map((hop) => hop.index),
+        [1, 2, 3, 4, 5, 6, 7],
+      );
+    });
+
     test(
-      'average length algorithm gives up early on massively clashing network',
-      () async {
+      'search budget still returns a complete path on a massively clashing network',
+      () {
         final pathBytes = List.generate(32, (i) => 0xaa);
         final repeaters = List.generate(
           256,
           (i) => repeater(0xaa, i, "Repeater $i", 31.0 + i, -120.0 + i),
         );
 
-        await Isolate.run(
-          () => PathResolver.buildPathHops(
-            Uint8List.fromList(pathBytes),
-            repeaters,
-          ),
-        ).timeout(Duration(seconds: 2));
+        final hops = PathResolver.buildPathHops(
+          Uint8List.fromList(pathBytes),
+          repeaters,
+        );
+
+        expect(hops.length, 32);
+        expect(hops.map((hop) => hop.contact).toSet().length, 32);
       },
     );
 
@@ -141,7 +159,7 @@ void main() {
         PathResolver.buildPathHops(
           Uint8List.fromList(pathBytes),
           repeaters,
-          startLocation: myLocation,
+          startLocation: LatLng(29.0, -120.0),
         ).map((hop) => hop.contact!.name),
         [
           'Repeater A',
@@ -153,7 +171,7 @@ void main() {
       );
     });
 
-    test('empty path returned when no repeaters match the path', () {
+    test('unknown repeaters are kept as placeholders with their prefix label', () {
       final pathBytes = [0x01, 0x02, 0x03];
       final repeaters = [
         repeater(0xaa, 0x00, "Repeater A", 30.0, -120.0),
@@ -161,14 +179,84 @@ void main() {
         repeater(0xcc, 0x00, "Repeater C", 34.0, -120.0),
       ];
 
-      expect(
-        PathResolver.buildPathHops(
-          Uint8List.fromList(pathBytes),
-          repeaters,
-          startLocation: myLocation,
-        ).map((hop) => hop.contact!.name),
-        [],
+      final hops = PathResolver.buildPathHops(
+        Uint8List.fromList(pathBytes),
+        repeaters,
+        startLocation: myLocation,
       );
+
+      expect(hops.map((hop) => hop.contact), [null, null, null]);
+      expect(hops.map((hop) => hop.fullPrefixLabel), ['01', '02', '03']);
+      expect(hops.map((hop) => hop.index), [1, 2, 3]);
+    });
+
+    test('an unknown repeater mid-path keeps the known hops around it', () {
+      final pathBytes = [0xaa, 0x55, 0xcc];
+      final repeaters = [
+        repeater(0xaa, 0x00, "Repeater A", 30.0, -120.0),
+        repeater(0xcc, 0x00, "Repeater C", 31.0, -120.0),
+      ];
+
+      final hops = PathResolver.buildPathHops(
+        Uint8List.fromList(pathBytes),
+        repeaters,
+      );
+
+      expect(
+        hops.map((hop) => hop.contact?.name),
+        ['Repeater A', null, 'Repeater C'],
+      );
+      expect(hops.map((hop) => hop.fullPrefixLabel), ['AA', '55', 'CC']);
+    });
+
+    test('a candidate implausibly far from the previous hop is treated as unknown', () {
+      final pathBytes = [0xaa, 0xbb];
+      final repeaters = [
+        repeater(0xaa, 0x00, "Repeater A", 35.0, -120.0),
+        repeater(0xbb, 0x00, "Far away", 55.0, -100.0),
+      ];
+
+      final hops = PathResolver.buildPathHops(
+        Uint8List.fromList(pathBytes),
+        repeaters,
+      );
+
+      expect(hops.map((hop) => hop.contact?.name), ['Repeater A', null]);
+    });
+
+    test('2-byte hashes resolve without clashing on a shared first byte', () {
+      final repeaters = [
+        node([0xaa, 0x11], 0x00, "A1", 35.0, -120.0),
+        node([0xaa, 0x22], 0x00, "A2", 35.1, -120.1),
+        node([0xbb, 0x33], 0x00, "B3", 35.2, -120.2),
+        node([0xbb, 0x44], 0x00, "B4", 35.3, -120.3),
+      ];
+
+      final hops = PathResolver.buildPathHops(
+        Uint8List.fromList([0xaa, 0x11, 0xaa, 0x22, 0xbb, 0x33]),
+        repeaters,
+        stride: 2,
+      );
+
+      expect(hops.map((hop) => hop.contact?.name), ['A1', 'A2', 'B3']);
+      expect(hops.map((hop) => hop.fullPrefixLabel), ['AA11', 'AA22', 'BB33']);
+      expect(hops.map((hop) => hop.index), [1, 2, 3]);
+    });
+
+    test('2-byte path with a trailing odd byte yields an unknown last hop', () {
+      final repeaters = [
+        node([0xaa, 0x11], 0x00, "A1", 35.0, -120.0),
+        node([0xbb, 0x33], 0x00, "B3", 35.2, -120.2),
+      ];
+
+      final hops = PathResolver.buildPathHops(
+        Uint8List.fromList([0xaa, 0x11, 0xbb]),
+        repeaters,
+        stride: 2,
+      );
+
+      expect(hops.map((hop) => hop.contact?.name), ['A1', null]);
+      expect(hops.map((hop) => hop.fullPrefixLabel), ['AA11', 'BB']);
     });
   });
 }
